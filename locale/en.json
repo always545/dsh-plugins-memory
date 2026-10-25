@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Project Memory",
+    "description": "Maintains a per-project memory/ knowledge base: long-term consensus, per-turn change sets injected into model context, bounded forgetting, and a /dreaming consolidation command."
+  }
+}

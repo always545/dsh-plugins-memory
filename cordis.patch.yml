@@ -1,0 +1,3 @@
+- insert:
+    - id: project-memory
+      name: '@local/dsh-project-memory'

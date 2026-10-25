@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="Project memory">
+  <rect x="4" y="4" width="88" height="88" rx="22" fill="#1F2937"/>
+  <rect x="20" y="24" width="56" height="10" rx="5" fill="#7C9CFF"/>
+  <rect x="20" y="43" width="40" height="10" rx="5" fill="#A9BEFF"/>
+  <rect x="20" y="62" width="48" height="10" rx="5" fill="#CBD8FF"/>
+  <circle cx="74" cy="68" r="7" fill="#F7C948"/>
+</svg>
