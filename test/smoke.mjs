@@ -5,17 +5,35 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
 import { DEFAULT_CONFIG, normalizeConfig } from '../lib/config.js'
+import { buildConsolidationBrief, jaccard, renderConsolidationBrief } from '../lib/consolidate.js'
 import { deriveCurrentFiles, mergeTurnChanges, planRetention } from '../lib/derive.js'
 import { buildDreamingPrompt, runDreaming } from '../lib/dreaming.js'
-import { autoSummary, buildPromptBlock, buildReadText, mergeTurnNotes, parseTurns, recordLine, validateAnnotation } from '../lib/format.js'
+import {
+  autoSummary,
+  buildPromptBlock,
+  buildReadText,
+  buildSearchText,
+  buildWorkingText,
+  mergeTurnNotes,
+  parseTurns,
+  recallLine,
+  recordLine,
+  validateAnnotation,
+  workingText,
+} from '../lib/format.js'
 import { isInsideMemoryDir, toProjectRelative } from '../lib/paths.js'
-import { MemoryStore, applySectionEdit, sectionsOf } from '../lib/store.js'
+import { buildRecallIndex, focusText, recallForPrompt, reinforcedIds, searchMemory } from '../lib/recall.js'
+import { decayFactor, deriveImportance, salience, storedImportance, TYPE_IMPORTANCE } from '../lib/salience.js'
+import { buildIndex, makeDoc, search, snippetOf, tokenize } from '../lib/search.js'
+import { longTermSections, MemoryStore, applySectionEdit, sectionsOf } from '../lib/store.js'
+import { createTools } from '../lib/tools.js'
 import { descendantIds, TurnTracker } from '../lib/tracker.js'
+import { WorkingMemory, workingSessionKey } from '../lib/working.js'
 
 let passed = 0
 const failures = []
@@ -60,8 +78,11 @@ function turn(overrides) {
     ...(overrides.subject ? { subject: overrides.subject } : {}),
     ...(overrides.detail ? { detail: overrides.detail } : {}),
     files: overrides.files ?? [],
+    ...(overrides.pinned === true ? { pinned: true } : {}),
+    ...(Number.isFinite(overrides.importance) ? { importance: overrides.importance } : {}),
+    ...(Number.isFinite(overrides.hits) ? { hits: overrides.hits } : {}),
     origin: 'snapshot',
-    source: 'auto',
+    source: overrides.source ?? 'auto',
   }
 }
 
@@ -96,6 +117,13 @@ try {
     assert.equal(isInsideMemoryDir('memory/long-term.md', 'memory'), true)
     assert.equal(isInsideMemoryDir('memoryish/a.md', 'memory'), false)
     assert.equal(isInsideMemoryDir('src/memory/a.md', 'memory'), false)
+  })
+
+  test('toProjectRelative tolerates another spelling of the project root', () => {
+    const rawRoot = project({ 'src/a.py': 'a' })
+    const canonicalRoot = realpathSync(rawRoot)
+    assert.equal(toProjectRelative(path.join(rawRoot, 'src/a.py'), canonicalRoot, canonicalRoot), 'src/a.py')
+    assert.equal(toProjectRelative(path.join(rawRoot, 'src/new-file.js'), canonicalRoot, canonicalRoot), 'src/new-file.js')
   })
 
   test('ensure creates the skeleton once and never overwrites user edits', () => {
@@ -488,6 +516,381 @@ try {
     store.ensure(root)
     const sections = sectionsOf(readFileSync(store.paths(root).longTerm, 'utf8'))
     assert.deepEqual(sections, ['项目概述', '技术栈', '目录结构与模块', '构建、运行与验证', '编码与协作约定', '重要决策'])
+  })
+
+  // ---------------------------------------------------------------------------
+  // Layered memory: configuration knobs.
+  // ---------------------------------------------------------------------------
+  test('normalizeConfig repairs the layered-memory knobs', () => {
+    const defaults = normalizeConfig({})
+    assert.equal(defaults.promptRefresh, 'session')
+    assert.equal(defaults.enableWorkingMemory, true)
+    assert.equal(defaults.injectRelevantTurns, DEFAULT_CONFIG.injectRelevantTurns)
+    assert.equal(defaults.importanceHalfLifeDays, DEFAULT_CONFIG.importanceHalfLifeDays)
+    const repaired = normalizeConfig({
+      promptRefresh: 'always',
+      importanceHalfLifeDays: 0,
+      workingMemoryMaxBytes: 10,
+      archiveSearchLimit: -5,
+      searchMaxResults: 999,
+    })
+    assert.equal(repaired.promptRefresh, 'session')
+    assert.equal(repaired.importanceHalfLifeDays, DEFAULT_CONFIG.importanceHalfLifeDays)
+    assert.equal(repaired.workingMemoryMaxBytes, DEFAULT_CONFIG.workingMemoryMaxBytes)
+    assert.equal(repaired.archiveSearchLimit, DEFAULT_CONFIG.archiveSearchLimit)
+    assert.equal(repaired.searchMaxResults, DEFAULT_CONFIG.searchMaxResults)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Retrieval: tokenization, BM25, snippets.
+  // ---------------------------------------------------------------------------
+  test('tokenize splits CJK into bigrams and drops stopwords', () => {
+    const terms = tokenize('修复 登录 Cookie 处理 the and')
+    assert.ok(terms.includes('修复'))
+    assert.ok(terms.includes('登录'))
+    assert.ok(terms.includes('处理'))
+    assert.ok(terms.includes('cookie'))
+    assert.ok(!terms.includes('the'))
+    assert.ok(!terms.includes('and'))
+    assert.deepEqual(tokenize(''), [])
+  })
+
+  test('BM25 ranks the relevant record first for CJK queries', () => {
+    const docs = [
+      makeDoc({ id: 'a', kind: 'turn', title: '数据库迁移脚本', body: '修复迁移回滚失败', at: '2026-10-25T10:00:00.000Z', importance: 0.7 }),
+      makeDoc({ id: 'b', kind: 'turn', title: '调整按钮颜色', body: 'CSS 变量替换', at: '2026-10-25T11:00:00.000Z', importance: 0.4 }),
+    ]
+    const index = buildIndex(docs)
+    const hits = search(index, '迁移 回滚', { limit: 5, now: Date.parse('2026-10-26T00:00:00.000Z') })
+    assert.equal(hits[0].doc.id, 'a')
+    assert.equal(hits.some((hit) => hit.doc.id === 'b'), false)
+  })
+
+  test('snippetOf cuts around the matched term and stays bounded', () => {
+    const text = `${'长'.repeat(200)}迁移失败${'尾'.repeat(200)}`
+    const snippet = snippetOf(text, ['迁移'], 60)
+    assert.ok(snippet.includes('迁移'))
+    assert.ok(Array.from(snippet).length <= 62)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Salience: importance, decay, reinforcement, retention.
+  // ---------------------------------------------------------------------------
+  test('salience combines importance, decay, and retrieval reinforcement', () => {
+    const cfg = config()
+    const now = Date.parse('2026-10-26T00:00:00.000Z')
+    const featured = turn({ type: 'feature', files: [{ path: 'a' }], source: 'agent', at: '2026-10-25T23:00:00.000Z' })
+    assert.ok(deriveImportance(featured) > deriveImportance(turn({ type: 'chore', at: featured.at })))
+    assert.ok(TYPE_IMPORTANCE.feature > TYPE_IMPORTANCE.chore)
+    const old = turn({ at: '2026-09-26T00:00:00.000Z', files: [{ path: 'a' }] })
+    const decayed = decayFactor(old, { now, config: cfg })
+    assert.ok(decayed < 0.5)
+    assert.ok(decayFactor({ ...old, hits: 10 }, { now, config: cfg }) > decayed)
+    assert.equal(storedImportance({ ...old, importance: 2 }), 1)
+    assert.ok(salience({ ...old, importance: 1, hits: 10 }, { now, config: cfg }) > salience(old, { now, config: cfg }))
+  })
+
+  test('retention keeps pinned records and stretches the window by importance', () => {
+    const now = Date.parse('2026-10-26T00:00:00.000Z')
+    const cfg = config()
+    const aged = '2026-01-01T00:00:00.000Z'
+    const pinnedPlan = planRetention([turn({ id: 'pin', at: aged, pinned: true, files: [{ path: 'a' }] })], { now, config: cfg })
+    assert.deepEqual(pinnedPlan.kept.map((record) => record.id), ['pin'])
+    const unpinnedPlan = planRetention([turn({ id: 'drop', at: aged, files: [{ path: 'a' }] })], { now, config: cfg })
+    assert.equal(unpinnedPlan.kept.length, 0)
+
+    const windowOf = (id, importance) =>
+      planRetention(
+        [
+          turn({ id, at: new Date(now - 30 * 3600_000).toISOString(), importance, files: [{ path: 'x' }] }),
+          turn({ id: 'newer', at: new Date(now - 3600_000).toISOString(), files: [{ path: 'x' }] }),
+        ],
+        { now, config: cfg },
+      )
+    assert.deepEqual(windowOf('important', 1).kept.map((record) => record.id), ['important', 'newer'])
+    assert.deepEqual(windowOf('dull', 0).forgotten.map((record) => record.id), ['dull'])
+  })
+
+  test('planRetention enforces the pinned budget last', () => {
+    const now = Date.parse('2026-10-26T00:00:00.000Z')
+    const aged = '2026-01-01T00:00:00.000Z'
+    const plan = planRetention(
+      [
+        turn({ id: 'p1', at: aged, pinned: true, files: [{ path: 'a' }] }),
+        turn({ id: 'p2', at: aged, pinned: true, files: [{ path: 'b' }] }),
+      ],
+      { now, config: config({ maxPinnedRecords: 1, maxShortTermRecords: 1 }) },
+    )
+    assert.equal(plan.kept.length, 1)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Working memory.
+  // ---------------------------------------------------------------------------
+  test('working memory merges updates, expires by TTL, and prunes', () => {
+    const root = project()
+    const cfg = normalizeConfig({ workingMemoryMaxSessions: 2 })
+    const working = new WorkingMemory(cfg)
+    const now = Date.parse('2026-10-26T00:00:00.000Z')
+    const first = working.write(root, 'session/a:b', { task: '重构记忆层', next: ['写检索', '写测试'] }, now)
+    assert.match(first.path, /session_a_b\.json$/)
+    assert.equal(workingSessionKey('a/b:c'), 'a_b_c')
+    assert.equal(working.read(root, 'session/a:b', now).task, '重构记忆层')
+    working.write(root, 'session/a:b', { next: ['写检索', '补文档'], notes: ['临时想法'] }, now + 1000)
+    const merged = working.read(root, 'session/a:b', now + 1000)
+    assert.deepEqual(merged.next, ['写检索', '写测试', '补文档'])
+    assert.deepEqual(merged.notes, ['临时想法'])
+    working.write(root, 'session/a:b', { next: ['只保留这个'], replaceArrays: true }, now + 2000)
+    assert.deepEqual(working.read(root, 'session/a:b', now + 2000).next, ['只保留这个'])
+    assert.equal(working.read(root, 'session/a:b', now + 2000 + 73 * 3600_000), null)
+
+    const fresh = now + 3000
+    working.write(root, 's1', { task: 'one' }, fresh)
+    working.write(root, 's2', { task: 'two' }, fresh + 1)
+    working.write(root, 's3', { task: 'three' }, fresh + 2)
+    assert.equal(working.prune(root, fresh + 10).removed, 2)
+
+    const tiny = new WorkingMemory(normalizeConfig({ workingMemoryMaxBytes: 512 }))
+    const squeezed = tiny.write(project(), 'big', { task: 'x'.repeat(300), next: ['y'.repeat(200), 'z'.repeat(200)], notes: ['n'.repeat(200)] }, now)
+    assert.ok(Buffer.byteLength(JSON.stringify(squeezed.state), 'utf8') <= 512)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Store: sections, pin patches, reinforcement, signatures.
+  // ---------------------------------------------------------------------------
+  test('store exposes sections, pin patches, reinforcement, and a signature', () => {
+    const root = project()
+    const store = new MemoryStore(config())
+    store.ensure(root)
+    const names = longTermSections(readFileSync(store.paths(root).longTerm, 'utf8')).map((section) => section.name)
+    assert.deepEqual(names, ['项目概述', '技术栈', '目录结构与模块', '构建、运行与验证', '编码与协作约定', '重要决策'])
+    assert.deepEqual(store.readLongTermSections(root).sections.map((section) => section.name), names)
+    const before = store.signature(root)
+    store.appendTurn(root, turn({ id: 't1', files: [{ path: 'a.py' }] }))
+    assert.notEqual(store.signature(root), before)
+    assert.equal(store.updateTurns(root, (record) => record.id === 't1', { pinned: true }).updated, 1)
+    assert.equal(store.readTurns(root).turns[0].pinned, true)
+    const now = Date.now()
+    assert.equal(store.touchTurns(root, ['t1'], now), 1)
+    assert.equal(store.readTurns(root).turns[0].hits, 1)
+    assert.equal(store.touchTurns(root, ['t1'], now + 1000), 0)
+    assert.equal(store.touchTurns(root, ['t1'], now + 7200_000, 0), 1)
+    assert.equal(store.readTurns(root).turns[0].hits, 2)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Recall: focus, relevance ranking, archive search.
+  // ---------------------------------------------------------------------------
+  test('recall ranks against the working focus and searches archived turns', () => {
+    const root = project()
+    const cfg = config()
+    const store = new MemoryStore(cfg)
+    store.ensure(root)
+    const now = Date.parse('2026-10-26T00:00:00.000Z')
+    store.appendTurn(root, turn({ id: 't-db', turn: 8, at: '2026-10-24T10:00:00.000Z', summary: '数据库迁移脚本回滚失败', files: [{ path: 'db/migrate.py' }] }))
+    store.appendTurn(root, turn({ id: 't-ui', turn: 9, at: '2026-10-25T10:00:00.000Z', summary: '调整按钮颜色与 CSS 变量', files: [{ path: 'web/theme.css' }] }))
+    const working = new WorkingMemory(cfg)
+    working.write(root, 'session-test', { task: '修复数据库迁移回滚' }, now)
+    const state = working.read(root, 'session-test', now)
+    assert.equal(focusText(state), '修复数据库迁移回滚')
+    const index = buildRecallIndex({ turns: store.readTurns(root).turns, archive: [], sections: [], working: state, config: cfg })
+    const recall = recallForPrompt({ index, focus: focusText(state), excludeIds: new Set(), limit: 3, now, config: cfg })
+    assert.equal(recall[0].recordId, 't-db')
+    const excluded = recallForPrompt({ index, focus: focusText(state), excludeIds: new Set(['t-db']), limit: 3, now, config: cfg })
+    assert.equal(excluded.every((item) => item.recordId !== 't-db'), true)
+
+    store.forget(root, (record) => record.id === 't-db')
+    const archived = searchMemory({
+      turns: store.readTurns(root).turns,
+      archive: store.readArchive(root, 10).entries,
+      sections: [],
+      query: '数据库 回滚',
+      limit: 5,
+      now,
+      config: cfg,
+    })
+    assert.equal(archived.items[0].kind, 'archive')
+    assert.equal(archived.items[0].recordId, 't-db')
+    assert.deepEqual([...reinforcedIds(archived.items)], ['t-db'])
+  })
+
+  // ---------------------------------------------------------------------------
+  // Prompt assembly with the new layers.
+  // ---------------------------------------------------------------------------
+  test('buildPromptBlock places working memory and recall around long-term memory', () => {
+    const root = project()
+    const store = new MemoryStore(config())
+    store.ensure(root)
+    writeFileSync(store.paths(root).longTerm, '# 项目长期记忆\n\n## 技术栈\n\nPython 3.12\n', 'utf8')
+    const text = buildPromptBlock({
+      project: 'jmd',
+      root,
+      language: 'zh',
+      longTerm: store.readLongTerm(root),
+      currentFiles: [],
+      recentTurns: [turn({ id: 't9', turn: 9, summary: '最近改动', files: [] })],
+      totalTurns: 9,
+      hiddenFiles: 0,
+      hiddenTurns: 5,
+      forgottenCount: 1,
+      working: { task: '重构记忆层', next: ['写检索'], questions: [], notes: [], updatedAt: new Date().toISOString() },
+      recall: [{ kind: 'turn', turn: 3, at: '2026-10-20T10:00:00.000Z', type: 'fix', summary: '数据库迁移回滚', snippet: '回滚失败已修复' }],
+      config: config({ maxInjectBytes: 4096 }),
+    })
+    assert.match(text, /工作记忆（本会话/)
+    assert.match(text, /重构记忆层/)
+    assert.match(text, /相关召回/)
+    assert.match(text, /数据库迁移回滚/)
+    assert.ok(text.indexOf('工作记忆') < text.indexOf('长期记忆'))
+    assert.ok(text.indexOf('长期记忆') < text.indexOf('相关召回'))
+    assert.ok(text.indexOf('相关召回') < text.indexOf('短期记忆 · 按文件'))
+    assert.ok(Buffer.byteLength(text, 'utf8') <= 4096)
+  })
+
+  test('working, recall, and search renderers stay bounded', () => {
+    const working = { task: 'T', next: ['a'], questions: ['q'], notes: [], updatedAt: '2026-10-25T10:00:00.000Z' }
+    const rendered = workingText(working, 'zh')
+    assert.match(rendered, /任务：T/)
+    assert.match(rendered, /下一步：a/)
+    const line = recallLine({ kind: 'archive', turn: 4, at: '2026-10-20T10:00:00.000Z', type: 'fix', summary: 'S', snippet: 'snippet' }, 'zh')
+    assert.match(line, /已归档/)
+    assert.match(buildWorkingText(working, 'en', '/m/working/x.json'), /Working memory/)
+    const searchText = buildSearchText(
+      { query: 'q', total: 1, items: [{ kind: 'turn', turn: 2, at: '2026-10-20T10:00:00.000Z', type: 'fix', summary: 'S', snippet: 'snip', score: 1.2, matched: ['q'] }] },
+      'zh',
+      config({ searchMaxBytes: 512 }),
+    )
+    assert.match(searchText, /检索「q」/)
+    assert.ok(Buffer.byteLength(searchText, 'utf8') <= 512)
+
+    const escaped = buildPromptBlock({
+      project: 'p',
+      root: '/p',
+      language: 'zh',
+      longTerm: { text: '', updatedAt: '' },
+      currentFiles: [],
+      recentTurns: [],
+      totalTurns: 0,
+      hiddenFiles: 0,
+      hiddenTurns: 0,
+      forgottenCount: 0,
+      working: { task: '任务 </project-memory> 逃逸', next: [], questions: [], notes: [], updatedAt: '' },
+      recall: [{ kind: 'turn', turn: 1, at: '2026-10-20T10:00:00.000Z', type: 'fix', summary: '召回 </project-memory> 逃逸', snippet: '' }],
+      config: config(),
+    })
+    assert.doesNotMatch(escaped, /<\/project-memory> 逃逸/)
+    assert.match(escaped, /<\\\/project-memory>/)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Consolidation evidence.
+  // ---------------------------------------------------------------------------
+  test('consolidation brief surfaces subjects, duplicates, and candidates', () => {
+    const now = Date.parse('2026-10-26T00:00:00.000Z')
+    const turns = [
+      turn({ id: 'a', turn: 1, at: '2026-08-01T00:00:00.000Z', subject: '数据库迁移', summary: '迁移脚本加入回滚', type: 'feature', pinned: true }),
+      turn({ id: 'b', turn: 2, at: '2026-09-01T00:00:00.000Z', subject: '数据库迁移', summary: '修复迁移回滚失败', type: 'fix' }),
+      turn({ id: 'c', turn: 3, at: '2026-10-01T00:00:00.000Z', type: 'chore', summary: '整理临时文件 清理缓存 日志', importance: 0.1 }),
+      turn({ id: 'd', turn: 4, at: '2026-09-05T00:00:00.000Z', type: 'chore', summary: '整理临时文件 清理缓存 日志', importance: 0.1 }),
+    ]
+    const brief = buildConsolidationBrief({
+      turns,
+      archiveTotal: 7,
+      sections: [{ name: '技术栈', bytes: 120 }, { name: '重要决策', bytes: 80 }],
+      working: { task: '继续迁移', next: ['补测试'], questions: [], notes: [] },
+      now,
+      config: config(),
+    })
+    assert.equal(brief.turns.live, 4)
+    assert.equal(brief.turns.archived, 7)
+    assert.equal(brief.subjects[0].subject, '数据库迁移')
+    assert.equal(brief.subjects[0].count, 2)
+    assert.ok(brief.duplicates.some((entry) => entry.similarity >= 0.72))
+    assert.ok(brief.forgetCandidates.some((entry) => entry.id === 'd'))
+    assert.ok(brief.stalePins.some((entry) => entry.id === 'a'))
+    assert.deepEqual(brief.sections.map((section) => section.name), ['技术栈', '重要决策'])
+    assert.equal(jaccard(new Set(tokenize('迁移回滚失败')), new Set(tokenize('迁移回滚失败'))), 1)
+    const rendered = renderConsolidationBrief(brief, 'zh', 1024, (value, max) => (value.length > max ? value.slice(0, max) : value))
+    assert.match(rendered, /数据库迁移/)
+    assert.match(rendered, /固定/)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Tools: search, working memory, pin.
+  // ---------------------------------------------------------------------------
+  test('memory tools search, reinforce, manage working memory, and pin', () => {
+    const root = project()
+    const cfg = config()
+    const store = new MemoryStore(cfg)
+    store.ensure(root)
+    store.appendTurn(root, turn({ id: 't-db', turn: 5, at: new Date().toISOString(), summary: '数据库迁移回滚失败', files: [{ path: 'db/migrate.py' }] }))
+    const working = new WorkingMemory(cfg)
+    const session = { id: 'session-test', header: { cwd: root } }
+    const ctx = {
+      sessions: { get: (id) => (id === 'session-test' ? session : null) },
+      get: (name) => (name === 'workingDirectory' ? { get: () => root } : undefined),
+    }
+    const tools = createTools({ ctx, store, working, tracker: new TurnTracker(), config: cfg })
+    const byName = new Map(tools.map((tool) => [tool.name, tool]))
+    assert.deepEqual([...byName.keys()].sort(), [
+      'memory_forget',
+      'memory_pin',
+      'memory_read',
+      'memory_record',
+      'memory_search',
+      'memory_update_long_term',
+      'memory_work',
+    ])
+    const execution = { agent: { id: 'session-test', session } }
+
+    const searched = byName.get('memory_search').execute({ query: '数据库 回滚' }, execution)
+    assert.equal(searched.items[0].recordId, 't-db')
+    assert.equal(searched.items[0].turn, 5)
+    assert.equal(store.readTurns(root).turns[0].hits, 1)
+
+    const workTool = byName.get('memory_work')
+    const updated = workTool.execute({ op: 'update', task: '修复迁移', next: ['补测试'] }, execution)
+    assert.equal(updated.state.task, '修复迁移')
+    assert.deepEqual(updated.state.next, ['补测试'])
+    assert.equal(workTool.execute({ op: 'read' }, execution).state.exists, true)
+    assert.equal(workTool.execute({ op: 'clear' }, execution).state.exists, false)
+
+    const pinTool = byName.get('memory_pin')
+    const pinned = pinTool.execute({ ids: ['t-db'] }, execution)
+    assert.equal(pinned.updated, 1)
+    assert.equal(pinned.totalPinned, 1)
+    assert.equal(pinTool.execute({ ids: ['t-db'], pinned: false }, execution).totalPinned, 0)
+
+    const read = byName.get('memory_read')
+    assert.ok(read.execute({ scope: 'brief' }, execution).brief.length > 0)
+    assert.equal(read.execute({ scope: 'working' }, execution).working.exists, false)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Dreaming carries the evidence brief.
+  // ---------------------------------------------------------------------------
+  test('dreaming prompt carries the consolidation brief and the new tools', () => {
+    const root = project()
+    const cfg = config()
+    const store = new MemoryStore(cfg)
+    store.appendTurn(root, turn({ id: 't1', turn: 1, subject: '数据库迁移', summary: '迁移脚本加入回滚', files: [{ path: 'db/migrate.py' }] }))
+    store.appendTurn(root, turn({ id: 't2', turn: 2, subject: '数据库迁移', summary: '修复迁移回滚失败', files: [{ path: 'db/migrate.py' }] }))
+    const calls = []
+    const result = runDreaming({
+      agent: { followup: (message) => calls.push(message) },
+      session: { id: 'session-test' },
+      root,
+      store,
+      workingStore: new WorkingMemory(cfg),
+      config: cfg,
+      inFlight: new Map(),
+    })
+    assert.equal(result.kind, 'success')
+    assert.equal(calls.length, 1)
+    const prompt = calls[0].content[0].text
+    assert.match(prompt, /数据库迁移 ×2/)
+    assert.match(prompt, /memory_pin/)
+    assert.match(prompt, /memory_search/)
   })
 } finally {
   for (const root of temporary) {

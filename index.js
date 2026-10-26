@@ -18,10 +18,13 @@ import { normalizeConfig } from './lib/config.js'
 import { deriveCurrentFiles, mergeTurnChanges } from './lib/derive.js'
 import { buildPromptBlock, makeRecordId, mergeTurnNotes, truncateUtf8 } from './lib/format.js'
 import { canonicalize, isDirectory, isInsideMemoryDir, projectRootOf, toProjectRelative } from './lib/paths.js'
+import { buildRecallIndex, focusText, recallForPrompt } from './lib/recall.js'
+import { deriveImportance } from './lib/salience.js'
 import { MemoryStore } from './lib/store.js'
 import { descendantIds, TurnTracker } from './lib/tracker.js'
 import { createTools } from './lib/tools.js'
 import { runDreaming } from './lib/dreaming.js'
+import { WorkingMemory } from './lib/working.js'
 
 export const name = 'project-memory'
 
@@ -39,10 +42,13 @@ export const inject = ['tools', 'systemPrompt', 'sessions']
 export function apply(ctx, rawConfig) {
   const config = normalizeConfig(rawConfig)
   const store = new MemoryStore(config)
+  const workingMemory = new WorkingMemory(config)
   const tracker = new TurnTracker()
 
   /** @type {Map<string, string>} session id → frozen prompt block */
   const frozen = new Map()
+  /** @type {Map<string, { sig: string, index: object }>} project root → cached recall index */
+  const recallCache = new Map()
   /** @type {Map<string, { turn: number, seq: number }>} session id → latest workspace/changes event */
   const changeEvents = new Map()
   /** @type {Map<string, Array<{ turn: number, resolve: (value: any) => void, timer: any }>>} */
@@ -68,6 +74,43 @@ export function apply(ctx, rawConfig) {
   const isSubagent = (session) => {
     const header = session?.header
     return Boolean(header && (header.origin === 'subagent' || header.parentSession))
+  }
+
+  /**
+   * Return the recall index for one project, rebuilding it only when the memory
+   * files or the session's working memory changed.
+   * @param {string} root project directory
+   * @param {object[]} turns live turn records
+   * @param {Array<{ name: string, body: string, at?: string }>} sections long-term sections
+   * @param {object[]} archive archived records, newest first
+   * @param {object | null} workingState working memory of the rendering session
+   * @returns {object} BM25 index
+   */
+  function recallIndexFor(root, turns, sections, archive, workingState) {
+    const signature = `${store.signature(root)}|${workingState?.updatedAt ?? ''}`
+    const cached = recallCache.get(root)
+    if (cached && cached.sig === signature) return cached.index
+    const index = buildRecallIndex({ turns, archive, sections, working: workingState, config })
+    recallCache.set(root, { sig: signature, index })
+    if (recallCache.size > 20) {
+      const oldest = recallCache.keys().next().value
+      if (oldest !== undefined) recallCache.delete(oldest)
+    }
+    return index
+  }
+
+  /**
+   * Drop expired working-memory files of one project.
+   * @param {string} root project directory
+   * @returns {void}
+   */
+  function pruneWorking(root) {
+    if (!config.enableWorkingMemory) return
+    try {
+      workingMemory.prune(root)
+    } catch (error) {
+      warn('pruning working memory failed', error)
+    }
   }
 
   /**
@@ -292,6 +335,7 @@ export function apply(ctx, rawConfig) {
     if (diffs.length) record.diff = diffs
     record.origin = originOf(snapshotFiles.length, trackedFiles.length, modelFiles.length)
     record.source = notes.source
+    record.importance = Math.round(deriveImportance(record) * 100) / 100
     store.appendTurn(root, record)
   }
 
@@ -356,6 +400,26 @@ export function apply(ctx, rawConfig) {
           const allCurrent = deriveCurrentFiles(turns.turns, 1000)
           const currentFiles = allCurrent.slice(0, config.injectCurrentFiles)
           const recentTurns = turns.turns.slice(-config.injectRecentTurns).reverse()
+          const workingState = config.enableWorkingMemory ? workingMemory.read(root, sessionId) : null
+          let recall = []
+          if (config.injectRelevantTurns > 0) {
+            try {
+              const sections = store.readLongTermSections(root).sections.map((section) => ({ ...section, at: longTerm.updatedAt }))
+              const archive = config.archiveSearchLimit > 0 ? store.readArchive(root, config.archiveSearchLimit).entries : []
+              const index = recallIndexFor(root, turns.turns, sections, archive, workingState)
+              const focus = focusText(workingState, turns.turns)
+              const excludeIds = new Set(recentTurns.map((turn) => turn.id).filter(Boolean))
+              recall = recallForPrompt({
+                index,
+                focus,
+                excludeIds,
+                limit: config.injectRelevantTurns,
+                config,
+              })
+            } catch (error) {
+              warn('building relevant recall failed', error)
+            }
+          }
           const text = buildPromptBlock({
             project: path.basename(root),
             root,
@@ -367,9 +431,11 @@ export function apply(ctx, rawConfig) {
             hiddenFiles: Math.max(0, allCurrent.length - currentFiles.length),
             hiddenTurns: Math.max(0, turns.turns.length - recentTurns.length),
             forgottenCount: store.countArchive(root),
+            working: workingState,
+            recall,
             config,
           })
-          if (text) frozen.set(sessionId, text)
+          if (text && config.promptRefresh !== 'turn') frozen.set(sessionId, text)
           return text
         } catch (error) {
           warn('rendering the memory prompt failed', error)
@@ -383,7 +449,7 @@ export function apply(ctx, rawConfig) {
   // Tools.
   // ---------------------------------------------------------------------------
   if (config.enableTools) {
-    for (const definition of createTools({ ctx, store, tracker, config })) {
+    for (const definition of createTools({ ctx, store, working: workingMemory, tracker, config })) {
       ctx.tools.register(definition)
     }
   }
@@ -412,7 +478,10 @@ export function apply(ctx, rawConfig) {
       frozen.delete(sessionId)
       recordedTurns.delete(sessionId)
       const root = ensureSession(session)
-      if (root) store.compact(root)
+      if (root) {
+        store.compact(root)
+        pruneWorking(root)
+      }
     } catch (error) {
       warn('agent initialization failed', error)
     }
@@ -485,7 +554,10 @@ export function apply(ctx, rawConfig) {
       if (event.type === 'working-directory/change') {
         frozen.delete(sessionId)
         const root = ensureSession(session)
-        if (root) store.compact(root)
+        if (root) {
+          store.compact(root)
+          pruneWorking(root)
+        }
         return
       }
       if (event.type === 'turn/end') {
@@ -496,6 +568,7 @@ export function apply(ctx, rawConfig) {
       if (event.type === 'turn/start') {
         const root = sessionRoot(session)
         if (root) dreamingInFlight.delete(root)
+        if (config.promptRefresh === 'turn') frozen.delete(sessionId)
       }
     } catch (error) {
       warn('handling a session event failed', error)
@@ -554,6 +627,7 @@ export function apply(ctx, rawConfig) {
               session,
               root,
               store,
+              workingStore: workingMemory,
               config,
               inFlight: dreamingInFlight,
               focus: invocation?.rawInput,

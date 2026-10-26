@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-project-memory",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "Per-project shared memory for DeepSeek Harness: long-term consensus, per-turn change sets, bounded forgetting, and a /dreaming consolidation command.",
+  "description": "Layered per-project memory for DeepSeek Harness: working memory, per-turn change sets, BM25 recall, salience-based forgetting, and an evidence-driven /dreaming consolidation command.",
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
@@ -17,6 +17,9 @@
     "icon.svg",
     "README.md"
   ],
+  "scripts": {
+    "test": "node test/smoke.mjs && node test/integration.mjs"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
